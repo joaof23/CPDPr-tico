@@ -1,211 +1,290 @@
-"""
-primos.py
-=========
-Módulo para a procura do maior número primo possível dentro de um limite temporal.
+"""""""""
+Implementação sequencial e paralela para a procura do maior número primo
+possível dentro de um limite temporal.
 
-Implementa:
-  - is_prime(n)                              : verificação de primalidade (fornecida pelo enunciado)
-  - find_max_prime_sequential(timeout)       : procura sequencial
-  - find_max_prime_parallel(timeout, workers): procura paralela com múltiplos processos
+Notas:
 
-Decisão de design:
-  Usa multiprocessing (processos) e não threads, porque o problema é CPU-bound.
-   o GIL  impede que threads executem código Python
-  verdadeiramente em paralelo. Processos contornam o GIL e deixam acontecer o  paralelismo .
+1) Porque usamos processos e não threads?
+   Ver numeros primos e uma tarefa cpu-bound. Em Python, threads não
+   costumam escalar bem neste tipo de problema devido ao GIL. O módulo
+   multiprocessing cria subprocessos independentes, permitindo paralelismo 
+   em múltiplos corees.
+
+
+
+3) Qual é a ideia da nossa abordagem paralela?
+   Em vez de dar a cada worker um conjunto fixo de números para sempre, usamos
+   alocação dinâmica por blocos . Cada worker vai pedindo o próximo
+   bloco disponível, testa os candidatos desse bloco e, no fim, volta a pedir
+   mais trabalho enquanto houver tempo.
+
+    reais vantagens desta abordagem:
+   - balanceamento de carga mais justo;
+   - assim existe menos risco de um worker ficar com trabalho "pior" que os outros;
+   - funciona bem com timeout, porque o espaço de procura não precisa de ser
+     conhecido à partida.
+
+4) Porque testar apenas números ímpares?
+   depois de tratar o caso do 2, faz sentido testar apenas ímpares. Isto reduz o número de
+   candidatos contiunuado a respeitar o enuciado pois usamos is_prime
+
+5) Descriçao da nossa sincronização?
+   - Um Value partilhado guarda o melhor primo global encontrado até ao momento.
+   - Outro Value guarda o número total de candidatos testados.
+   - Um terceiro Value guarda o próximo início de bloco a atribuir.
+   - Locks garantem que estas atualizações não criam race conditions.
+
+6) Porque atualizar o melhor primo global só no fim de cada chunk?
+   Se qualquer worker escrever no estado global a cada primo encontrado, haveria
+   muito overhead de sincronização. Guardar um melhor primo local dentro do
+   bloco e só depois tentar atualizar o global reduz contenção.
 """
 
 import time
 import multiprocessing
-
-
-# funçao de verificar prime (fornecida pelo enunciado)
+from typing import Tuple
 
 
 def is_prime(n: int) -> bool:
-    """
-    Verifica se um número inteiro é primo.
-
-    Parâmetros:
-        n (int): número a verificar.
-
-    Retorna:
-        bool: True se n é primo, False caso contrário.
-
-    Nota:
-        Esta função é fornecida pelo enunciado e não pode ser alterada.
-        Usa o algoritmo de divisão por 6k +/- 1, mais eficiente do que
-        testar todos os divisores até sqrt(n).
-    """
     if n < 2:
         return False
     if n in (2, 3):
         return True
     if n % 2 == 0 or n % 3 == 0:
         return False
-
     divisor = 5
     while divisor * divisor <= n:
         if n % divisor == 0 or n % (divisor + 2) == 0:
             return False
         divisor += 6
-
     return True
 
 
+# Tamanho do bloco de trabalho atribuído de cada vez a um worker.
+#CHUNK MAIOR -> MENOS OVERHEAD -> WORKERS DEMORAM MAIS
+CHUNK_SIZE = 100_000
 
-# VERSÃO SEQUENCIAL
 
-
-def find_max_prime_sequential(timeout: int):
+def _make_odd(n: int) -> int:
     """
-    Procura o maior número primo possível durante, no máximo, `timeout` segundos,
-    utilizando uma abordagem sequencial (single-thread, single-process).
+    Funçao aux  que ve se o  valor devolvido é ímpar.
 
-    A implementação explora o espaço de procura de forma contínua, testando
-    candidatos crescentes, até ao limite temporal.
-
-    Parâmetros:
-        timeout (int): tempo máximo de execução em segundos.
-
-    Retorna:
-        tuple(int, int): (maior primo encontrado, total de candidatos testados)
+    Se n já for ímpar, devolve-o. Se for par, devolve o ímpar seguinte.
+    Funçao aux  ajuda a garantir que a pesquisa principal percorre apenas
+    candidatos relevantes (todos os ímpares >= 3).
     """
-    best_prime = 2
-    candidate = 2
-    candidates_tested = 0
+    return n if n % 2 == 1 else n + 1
+
+
+def find_max_prime_sequential(timeout: int) -> Tuple[int, int]:
+    """
+    Procura sequencialmente o maior número primo possível dentro de `timeout`
+    segundos.
+
+    passos:
+      - Trata o caso do 2 como primo inicial conhecido.
+      - depois testa apenas números ímpares: 3, 5, 7, 9, ...
+      - Mantém sempre o maior primo encontrado até ao momento.
+      - Conta quantos candidatos foram testados.
+      - Pára imediatamente quando o tempo limite é atingido.
+
+    params:
+        timeout: tempo em ms.
+
+    Returns:
+        Tuplo (maior_primo_encontrado, candidatos_testados).
+
+
+    """
     start = time.monotonic()
 
+    # 2 é o menor e primeiro número primo.
+    best_prime = 2
+    tested = 0
+
+
+    candidate = 3
+
     while time.monotonic() - start < timeout:
-        candidates_tested += 1
+        tested += 1
         if is_prime(candidate):
             best_prime = candidate
-        candidate += 1
+        candidate += 2
 
-    return best_prime, candidates_tested
-
-
-
-# VERSÃO PARALELA - função de cada worker
+    return best_prime, tested
 
 
-def _worker(start_candidate: int, step: int, timeout: float, start_time: float,
-            best_value, lock, candidates_counter):
+def _prime_worker(
+    timeout: int,
+    start_time: float,
+    next_chunk_start,
+    best_prime,
+    tested_count,
+    chunk_lock,
+    best_lock,
+    tested_lock,
+    chunk_size: int,
+) -> None:
     """
-    Função executada por cada processo worker na versão paralela.
+     versão paralela
 
-    Cada worker testa candidatos numa progressão aritmética com passo `step`,
-    começando em `start_candidate`. Esta estratégia garante divisão explícita
-    e equilibrada do espaço de procura sem sobreposição entre workers.
+    O worker repete o seguinte ciclo enquanto houver tempo:
+      1. Pede, de forma sincronizada, o próximo bloco de candidatos ímpares.
+      2. Testa todos os números ímpares desse bloco.
+      3. Conta quantos candidatos testou localmente.
+      4. Guarda o melhor primo local encontrado nesse bloco.
+      5. No fim do bloco, atualiza os contadores globais com locks.
 
-    Exemplo com 4 workers:
-        worker 0 testa: 2, 6, 10, 14, ...
-        worker 1 testa: 3, 7, 11, 15, ...
-        worker 2 testa: 4, 8, 12, 16, ...
-        worker 3 testa: 5, 9, 13, 17, ...
+    Porque existe um start_time comum passado pelo processo principal?
+      Para que todos os workers usem exatamente a mesma referência temporal e
+      parem de forma coordenada.
 
-    Parâmetros:
-        start_candidate (int)  : primeiro candidato deste worker.
-        step (int)             : passo entre candidatos (igual ao número de workers).
-        timeout (float)        : tempo máximo em segundos.
-        start_time (float)     : instante de início partilhado por todos os workers.
-        best_value             : multiprocessing.Value partilhado para o melhor primo global.
-        lock                   : multiprocessing.Lock para proteger escritas em best_value.
-        candidates_counter     : multiprocessing.Value para contar candidatos testados no total.
+    Porque cada worker mantém variáveis locais primeiro?
+      Porque operações locais são mais baratas do que tocar constantemente em
+      memória partilhada protegida por locks.
     """
-    candidate = start_candidate
-    local_count = 0  # Contador local para minimizar acessos à memória partilhada
+    local_best = 2
+    local_tested_total = 0
 
-    while time.monotonic() - start_time < timeout:
-        local_count += 1
-        if is_prime(candidate):
-            with lock:
-                if candidate > best_value.value:
-                    best_value.value = candidate
-        candidate += step
+    while True:
+        if time.monotonic() - start_time >= timeout:
+            break
 
-    # Atualizar o contador global com o total deste worker (uma só escrita no fim)
-    with lock:
-        candidates_counter.value += local_count
+        # reservar o próximo bloco ainda não atribuído.
+        with chunk_lock:
+            block_start = next_chunk_start.value
+            next_chunk_start.value += 2 * chunk_size
+
+        # Ajustamos o início para garantir que é ímpar.
+        block_start = _make_odd(block_start)
+        block_end = block_start + 2 * chunk_size
+
+        block_best = local_best
+        block_tested = 0
+
+        # Testa apenas ímpares dentro do bloco reservado.
+        candidate = block_start
+        while candidate < block_end:
+            if time.monotonic() - start_time >= timeout:
+                break
+
+            block_tested += 1
+            if is_prime(candidate) and candidate > block_best:
+                block_best = candidate
+
+            candidate += 2
+
+        local_tested_total += block_tested
+        local_best = max(local_best, block_best)
+
+        # Atualização do melhor primo global.
+        if block_best > best_prime.value:
+            with best_lock:
+                if block_best > best_prime.value:
+                    best_prime.value = block_best
+
+    # Atualização final do número total de candidatos testados.
+    # É feita uma vez por worker para reduzir contenção.
+    with tested_lock:
+        tested_count.value += local_tested_total
 
 
-
-# VERSÃO PARALELA - função principal
-
-
-def find_max_prime_parallel(timeout: int, workers: int):
+def find_max_prime_parallel(timeout: int, workers: int) -> Tuple[int, int]:
     """
-    Procura o maior número primo possível durante, no máximo, `timeout` segundos,
-    recorrendo à execução paralela de múltiplos processos (workers).
+    Procura paralelamente o maior número primo possível dentro de `timeout`
+    segundos, usando `workers` processos.
 
-    Estratégia de divisão do espaço de procura:
-        Os candidatos são distribuídos por interleaving (intercalação):
-        worker i testa os candidatos 2+i, 2+i+workers, 2+i+2*workers, ...
-        Isto garante cobertura completa, sem sobreposição e com carga equilibrada.
+    Como acontece:
+      - Multiprocessing com processos independentes.
+      - Divisão dinâmica do espaço de procura por blocos de candidatos ímpares.
+      - Cada worker pede trabalho ao processo principal através de um contador
+        partilhado.
+      - Cada worker mantém um melhor primo local e só no fim do bloco tenta
+        atualizar o melhor primo global.
+      - A terminação acontece de forma coordenada usando o mesmo relógio base
+        e verificações periódicas de timeout.
 
-    Sincronização:
-        O melhor primo global é guardado numa variável partilhada (multiprocessing.Value)
-        protegida por um Lock, evitando race conditions.
+    params:
+        timeout: tempo máximo de execução em segundos.
+        workers: número de processos a criar.
 
-    Terminação coordenada:
-        Todos os workers terminam quando o tempo limite é atingido, verificando
-        periodicamente o tempo decorrido.
+    Returns:
+        Tuplo (maior_primo_encontrado, candidatos_testados).
 
-    Parâmetros:
-        timeout (int) : tempo máximo de execução em segundos.
-        workers (int) : número de processos paralelos a utilizar.
+    Justificação do uso de processos:
+        A tarefa é CPU-bound; processos permitem explorar vários cores reais.
 
-    Retorna:
-        tuple(int, int): (maior primo encontrado, total de candidatos testados)
+    Justificação da divisão dinâmica:
+        Como o problema termina por tempo e não por limite superior fixo, não faz
+        sentido repartir à cabeça um intervalo que não sabemos qual será.
+        A alocação dinâmica por chunks adapta-se naturalmente ao timeout.
     """
-    best_value = multiprocessing.Value('l', 2)        # Melhor primo partilhado
-    candidates_counter = multiprocessing.Value('l', 0) # Contador total de candidatos
-    lock = multiprocessing.Lock()
+    if workers < 1:
+        raise ValueError("workers deve ser >= 1")
+
     start_time = time.monotonic()
 
+    # Estado global partilhado.
+    # best_prime começa em 2 porque é o menor primo conhecido.
+    best_prime = multiprocessing.Value("q", 2)
+
+    # Número total de candidatos testados por todos os workers.
+    tested_count = multiprocessing.Value("q", 0)
+
+    # Próximo início de chunk a distribuir.
+    # Começamos em 3 porque 2 já foi tratado.
+    next_chunk_start = multiprocessing.Value("q", 3)
+
+    # Locks separados tornam a intenção mais clara:
+    # - chunk_lock protege a reserva do próximo bloco;
+    # - best_lock protege a atualização do melhor primo global;
+    # - tested_lock protege o acumulado total de candidatos testados.
+    chunk_lock = multiprocessing.Lock()
+    best_lock = multiprocessing.Lock()
+    tested_lock = multiprocessing.Lock()
+
     processes = []
-    for i in range(workers):
+    for _ in range(workers):
         p = multiprocessing.Process(
-            target=_worker,
-            args=(2 + i, workers, timeout, start_time, best_value, lock, candidates_counter)
+            target=_prime_worker,
+            args=(
+                timeout,
+                start_time,
+                next_chunk_start,
+                best_prime,
+                tested_count,
+                chunk_lock,
+                best_lock,
+                tested_lock,
+                CHUNK_SIZE,
+            ),
         )
         processes.append(p)
         p.start()
 
+    # Espera coordenada pela conclusão de todos os workers.
     for p in processes:
         p.join()
 
-    return best_value.value, candidates_counter.value
-
-
-
-# BLOCO DE TESTE RÁPIDO (execução direta do ficheiro)
+    return best_prime.value, tested_count.value
 
 
 if __name__ == "__main__":
-    TIMEOUT = 5
 
-    print(f"=== Sequencial (timeout={TIMEOUT}s) ===")
+    multiprocessing.freeze_support()
+
+    TIMEOUT = 2
+    WORKERS = min(4, multiprocessing.cpu_count())
+
+    print("=== Demonstração de primos ===")
+    print(f"Timeout: {TIMEOUT}s | Workers: {WORKERS}")
+
     t0 = time.monotonic()
-    primo_seq, testados_seq = find_max_prime_sequential(TIMEOUT)
+    seq_prime, seq_tested = find_max_prime_sequential(TIMEOUT)
     t1 = time.monotonic()
-    print(f"Maior primo         : {primo_seq}")
-    print(f"Nº de algarismos    : {len(str(primo_seq))}")
-    print(f"Candidatos testados : {testados_seq:,}")
-    print(f"Tempo de execução   : {t1 - t0:.2f}s")
 
-    print()
-
-    NUM_WORKERS = multiprocessing.cpu_count()
-    print(f"=== Paralelo (timeout={TIMEOUT}s, workers={NUM_WORKERS}) ===")
+    par_prime, par_tested = find_max_prime_parallel(TIMEOUT, WORKERS)
     t2 = time.monotonic()
-    primo_par, testados_par = find_max_prime_parallel(TIMEOUT, NUM_WORKERS)
-    t3 = time.monotonic()
-    print(f"Maior primo         : {primo_par}")
-    print(f"Nº de algarismos    : {len(str(primo_par))}")
-    print(f"Candidatos testados : {testados_par:,}")
-    print(f"Tempo de execução   : {t3 - t2:.2f}s")
 
-    print()
-    ganhou = "MAIOR" if primo_par >= primo_seq else "menor"
-    print(f"A versão paralela encontrou um primo {ganhou} do que a sequencial.")
-    print(f"Candidatos testados pela paralela: {testados_par/testados_seq:.1f}x mais do que a sequencial.")
+    print(f"Sequencial -> primo={seq_prime}, testados={seq_tested:,}, tempo={t1-t0:.3f}s")
+    print(f"Paralelo   -> primo={par_prime}, testados={par_tested:,}, tempo={t2-t1:.3f}s")
